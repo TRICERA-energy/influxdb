@@ -167,6 +167,22 @@
 				"Accumulate":"acc++",
 				"AccEmit": "c.res.Timestamps[pos] = windowEnd; c.res.Values[pos] = acc",
 				"AccReset":"acc = 0"
+			},
+			{
+				"Name":"Min",
+				"OutputTypeName":"Boolean",
+				"AccDecls":"var acc bool = true; var tsAcc int64",
+				"Accumulate":"if !windowHasPoints || (acc && !a.Values[rowIdx]) { acc = a.Values[rowIdx]; tsAcc = a.Timestamps[rowIdx] }",
+				"AccEmit":"c.res.Timestamps[pos] = tsAcc; c.res.Values[pos] = acc",
+				"AccReset":"acc = true"
+			},
+			{
+				"Name":"Max",
+				"OutputTypeName":"Boolean",
+				"AccDecls":"var acc bool = false; var tsAcc int64",
+				"Accumulate":"if !windowHasPoints || (!acc && a.Values[rowIdx]) { acc = a.Values[rowIdx]; tsAcc = a.Timestamps[rowIdx] }",
+				"AccEmit":"c.res.Timestamps[pos] = tsAcc; c.res.Values[pos] = acc",
+				"AccReset":"acc = false"
 			}
 		]
 	}

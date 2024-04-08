@@ -154,6 +154,9 @@ func newWindowMinArrayCursor(cur cursors.Cursor, window interval.Window) cursors
 	case cursors.UnsignedArrayCursor:
 		return newUnsignedWindowMinArrayCursor(cur, window)
 
+	case cursors.BooleanArrayCursor:
+		return newBooleanWindowMinArrayCursor(cur, window)
+
 	default:
 		panic(fmt.Sprintf("unsupported for aggregate min: %T", cur))
 	}
@@ -170,6 +173,9 @@ func newWindowMaxArrayCursor(cur cursors.Cursor, window interval.Window) cursors
 
 	case cursors.UnsignedArrayCursor:
 		return newUnsignedWindowMaxArrayCursor(cur, window)
+
+	case cursors.BooleanArrayCursor:
+		return newBooleanWindowMaxArrayCursor(cur, window)
 
 	default:
 		panic(fmt.Sprintf("unsupported for aggregate max: %T", cur))
@@ -3676,6 +3682,236 @@ WINDOWS:
 			// do not generate a point for empty windows
 			if windowHasPoints {
 				c.res.Timestamps[pos] = windowEnd
+				c.res.Values[pos] = acc
+				pos++
+			}
+			break WINDOWS
+		}
+		rowIdx = 0
+	}
+
+	c.res.Timestamps = c.res.Timestamps[:pos]
+	c.res.Values = c.res.Values[:pos]
+
+	return c.res
+}
+
+type booleanWindowMinArrayCursor struct {
+	cursors.BooleanArrayCursor
+	res    *cursors.BooleanArray
+	tmp    *cursors.BooleanArray
+	window interval.Window
+}
+
+func newBooleanWindowMinArrayCursor(cur cursors.BooleanArrayCursor, window interval.Window) *booleanWindowMinArrayCursor {
+	resLen := MaxPointsPerBlock
+	if window.IsZero() {
+		resLen = 1
+	}
+	return &booleanWindowMinArrayCursor{
+		BooleanArrayCursor: cur,
+		res:                cursors.NewBooleanArrayLen(resLen),
+		tmp:                &cursors.BooleanArray{},
+		window:             window,
+	}
+}
+
+func (c *booleanWindowMinArrayCursor) Stats() cursors.CursorStats {
+	return c.BooleanArrayCursor.Stats()
+}
+
+func (c *booleanWindowMinArrayCursor) Next() *cursors.BooleanArray {
+	pos := 0
+	c.res.Timestamps = c.res.Timestamps[:cap(c.res.Timestamps)]
+	c.res.Values = c.res.Values[:cap(c.res.Values)]
+
+	var a *cursors.BooleanArray
+	if c.tmp.Len() > 0 {
+		a = c.tmp
+	} else {
+		a = c.BooleanArrayCursor.Next()
+	}
+
+	if a.Len() == 0 {
+		return &cursors.BooleanArray{}
+	}
+
+	rowIdx := 0
+	var acc bool = true
+	var tsAcc int64
+
+	var windowEnd int64
+	if !c.window.IsZero() {
+		windowEnd = int64(c.window.GetLatestBounds(values.Time(a.Timestamps[rowIdx])).Stop())
+	} else {
+		windowEnd = math.MaxInt64
+	}
+	windowHasPoints := false
+
+	// enumerate windows
+WINDOWS:
+	for {
+		for ; rowIdx < a.Len(); rowIdx++ {
+			ts := a.Timestamps[rowIdx]
+			if !c.window.IsZero() && ts >= windowEnd {
+				// new window detected, close the current window
+				// do not generate a point for empty windows
+				if windowHasPoints {
+					c.res.Timestamps[pos] = tsAcc
+					c.res.Values[pos] = acc
+					pos++
+					if pos >= MaxPointsPerBlock {
+						// the output array is full,
+						// save the remaining points in the input array in tmp.
+						// they will be processed in the next call to Next()
+						c.tmp.Timestamps = a.Timestamps[rowIdx:]
+						c.tmp.Values = a.Values[rowIdx:]
+						break WINDOWS
+					}
+				}
+
+				// start the new window
+				acc = true
+				windowEnd = int64(c.window.GetLatestBounds(values.Time(ts)).Stop())
+				windowHasPoints = false
+
+				continue WINDOWS
+			} else {
+				if !windowHasPoints || (acc && !a.Values[rowIdx]) {
+					acc = a.Values[rowIdx]
+					tsAcc = a.Timestamps[rowIdx]
+				}
+				windowHasPoints = true
+			}
+		}
+
+		// Clear buffered timestamps & values if we make it through a cursor.
+		// The break above will skip this if a cursor is partially read.
+		c.tmp.Timestamps = nil
+		c.tmp.Values = nil
+
+		// get the next chunk
+		a = c.BooleanArrayCursor.Next()
+		if a.Len() == 0 {
+			// write the final point
+			// do not generate a point for empty windows
+			if windowHasPoints {
+				c.res.Timestamps[pos] = tsAcc
+				c.res.Values[pos] = acc
+				pos++
+			}
+			break WINDOWS
+		}
+		rowIdx = 0
+	}
+
+	c.res.Timestamps = c.res.Timestamps[:pos]
+	c.res.Values = c.res.Values[:pos]
+
+	return c.res
+}
+
+type booleanWindowMaxArrayCursor struct {
+	cursors.BooleanArrayCursor
+	res    *cursors.BooleanArray
+	tmp    *cursors.BooleanArray
+	window interval.Window
+}
+
+func newBooleanWindowMaxArrayCursor(cur cursors.BooleanArrayCursor, window interval.Window) *booleanWindowMaxArrayCursor {
+	resLen := MaxPointsPerBlock
+	if window.IsZero() {
+		resLen = 1
+	}
+	return &booleanWindowMaxArrayCursor{
+		BooleanArrayCursor: cur,
+		res:                cursors.NewBooleanArrayLen(resLen),
+		tmp:                &cursors.BooleanArray{},
+		window:             window,
+	}
+}
+
+func (c *booleanWindowMaxArrayCursor) Stats() cursors.CursorStats {
+	return c.BooleanArrayCursor.Stats()
+}
+
+func (c *booleanWindowMaxArrayCursor) Next() *cursors.BooleanArray {
+	pos := 0
+	c.res.Timestamps = c.res.Timestamps[:cap(c.res.Timestamps)]
+	c.res.Values = c.res.Values[:cap(c.res.Values)]
+
+	var a *cursors.BooleanArray
+	if c.tmp.Len() > 0 {
+		a = c.tmp
+	} else {
+		a = c.BooleanArrayCursor.Next()
+	}
+
+	if a.Len() == 0 {
+		return &cursors.BooleanArray{}
+	}
+
+	rowIdx := 0
+	var acc bool = false
+	var tsAcc int64
+
+	var windowEnd int64
+	if !c.window.IsZero() {
+		windowEnd = int64(c.window.GetLatestBounds(values.Time(a.Timestamps[rowIdx])).Stop())
+	} else {
+		windowEnd = math.MaxInt64
+	}
+	windowHasPoints := false
+
+	// enumerate windows
+WINDOWS:
+	for {
+		for ; rowIdx < a.Len(); rowIdx++ {
+			ts := a.Timestamps[rowIdx]
+			if !c.window.IsZero() && ts >= windowEnd {
+				// new window detected, close the current window
+				// do not generate a point for empty windows
+				if windowHasPoints {
+					c.res.Timestamps[pos] = tsAcc
+					c.res.Values[pos] = acc
+					pos++
+					if pos >= MaxPointsPerBlock {
+						// the output array is full,
+						// save the remaining points in the input array in tmp.
+						// they will be processed in the next call to Next()
+						c.tmp.Timestamps = a.Timestamps[rowIdx:]
+						c.tmp.Values = a.Values[rowIdx:]
+						break WINDOWS
+					}
+				}
+
+				// start the new window
+				acc = false
+				windowEnd = int64(c.window.GetLatestBounds(values.Time(ts)).Stop())
+				windowHasPoints = false
+
+				continue WINDOWS
+			} else {
+				if !windowHasPoints || (!acc && a.Values[rowIdx]) {
+					acc = a.Values[rowIdx]
+					tsAcc = a.Timestamps[rowIdx]
+				}
+				windowHasPoints = true
+			}
+		}
+
+		// Clear buffered timestamps & values if we make it through a cursor.
+		// The break above will skip this if a cursor is partially read.
+		c.tmp.Timestamps = nil
+		c.tmp.Values = nil
+
+		// get the next chunk
+		a = c.BooleanArrayCursor.Next()
+		if a.Len() == 0 {
+			// write the final point
+			// do not generate a point for empty windows
+			if windowHasPoints {
+				c.res.Timestamps[pos] = tsAcc
 				c.res.Values[pos] = acc
 				pos++
 			}
