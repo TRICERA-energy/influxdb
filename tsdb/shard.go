@@ -200,6 +200,24 @@ func (s *Shard) setEnabledNoLock(enabled bool) {
 	}
 }
 
+// SetNewReadersBlocked sets if new readers can access the shard. If blocked
+// is true, the number of reader blocks is incremented and new readers will
+// receive an error instead of shard access. If blocked is false, the number
+// of reader blocks is decremented. If the reader blocks drops to 0, then
+// new readers will be granted access to the shard.
+func (s *Shard) SetNewReadersBlocked(blocked bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s._engine.SetNewReadersBlocked(blocked)
+}
+
+// InUse returns true if this shard is in-use.
+func (s *Shard) InUse() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s._engine.InUse()
+}
+
 // ScheduleFullCompaction forces a full compaction to be schedule on the shard.
 func (s *Shard) ScheduleFullCompaction() error {
 	engine, err := s.Engine()
@@ -2258,10 +2276,12 @@ func (fscm *measurementFieldSetChangeMgr) appendToChangesFile(first writeRequest
 	// requests
 	for {
 		select {
-		case wr := <-fscm.writeRequests:
-			changes = append(changes, wr.changes)
-			errorChannels = append(errorChannels, wr.errorReturn)
-			continue
+		case wr, ok := <-fscm.writeRequests:
+			if ok {
+				changes = append(changes, wr.changes)
+				errorChannels = append(errorChannels, wr.errorReturn)
+				continue
+			}
 		default:
 		}
 		break
