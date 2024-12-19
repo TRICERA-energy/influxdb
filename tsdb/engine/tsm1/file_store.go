@@ -176,9 +176,8 @@ type FileStore struct {
 	currentGeneration int
 	dir               string
 
-	files           []TSMFile
-	tsmMMAPWillNeed bool          // If true then the kernel will be advised MMAP_WILLNEED for TSM files.
-	openLimiter     limiter.Fixed // limit the number of concurrent opening TSM files.
+	files       []TSMFile
+	openLimiter limiter.Fixed // limit the number of concurrent opening TSM files.
 
 	logger       *zap.Logger // Logger to be used for important messages
 	traceLogger  *zap.Logger // Logger to be used when trace-logging is on.
@@ -198,6 +197,8 @@ type FileStore struct {
 	// newReaderBlockCount keeps track of the current new reader block requests.
 	// If non-zero, no new TSMReader objects may be created.
 	newReaderBlockCount int
+
+	readerOptions []tsmReaderOption
 }
 
 // FileStat holds information about a TSM file on disk.
@@ -234,7 +235,7 @@ func (f FileStat) ContainsKey(key []byte) bool {
 }
 
 // NewFileStore returns a new instance of FileStore based on the given directory.
-func NewFileStore(dir string, tags tsdb.EngineTags) *FileStore {
+func NewFileStore(dir string, tags tsdb.EngineTags, options ...tsmReaderOption) *FileStore {
 	logger := zap.NewNop()
 	fs := &FileStore{
 		dir:          dir,
@@ -250,6 +251,7 @@ func NewFileStore(dir string, tags tsdb.EngineTags) *FileStore {
 		obs:           noFileStoreObserver{},
 		parseFileName: DefaultParseFileName,
 		copyFiles:     runtime.GOOS == "windows",
+		readerOptions: options,
 	}
 	fs.purger.fileStore = fs
 	return fs
@@ -549,7 +551,7 @@ func (f *FileStore) Open(ctx context.Context) error {
 	// find the current max ID for temp directories
 	tmpfiles, err := os.ReadDir(f.dir)
 	if err != nil {
-		return err
+		return fmt.Errorf("error calling ReadDir on %q in FileStore.Open: %w", f.dir, err)
 	}
 
 	// ascertain the current temp directory number by examining the existing
@@ -575,9 +577,10 @@ func (f *FileStore) Open(ctx context.Context) error {
 		f.currentTempDirID = i
 	}
 
-	files, err := filepath.Glob(filepath.Join(f.dir, "*."+TSMFileExtension))
+	pattern := filepath.Join(f.dir, "*."+TSMFileExtension)
+	files, err := filepath.Glob(pattern)
 	if err != nil {
-		return err
+		return fmt.Errorf("error in Glob for %q in FileStore.Open: %w", pattern, err)
 	}
 
 	// struct to hold the result of opening each reader in a goroutine
@@ -591,7 +594,7 @@ func (f *FileStore) Open(ctx context.Context) error {
 		// Keep track of the latest ID
 		generation, _, err := f.parseFileName(fn)
 		if err != nil {
-			return err
+			return fmt.Errorf("error parsing %q in FileStore.Open: %w", fn, err)
 		}
 
 		if generation >= f.currentGeneration {
@@ -600,7 +603,7 @@ func (f *FileStore) Open(ctx context.Context) error {
 
 		file, err := os.OpenFile(fn, os.O_RDONLY, 0666)
 		if err != nil {
-			return fmt.Errorf("error opening file %s: %v", fn, err)
+			return fmt.Errorf("error calling OpenFile on %q in FileStore.Open: %w", fn, err)
 		}
 
 		go func(idx int, file *os.File) {
@@ -615,26 +618,38 @@ func (f *FileStore) Open(ctx context.Context) error {
 			defer f.openLimiter.Release()
 
 			start := time.Now()
-			df, err := NewTSMReader(file, WithMadviseWillNeed(f.tsmMMAPWillNeed))
+			df, err := NewTSMReader(file, f.readerOptions...)
 			f.logger.Info("Opened file",
 				zap.String("path", file.Name()),
 				zap.Int("id", idx),
 				zap.Duration("duration", time.Since(start)))
 
-			// If we are unable to read a TSM file then log the error, rename
-			// the file, and continue loading the shard without it.
+			// If we are unable to read a TSM file then log the error.
 			if err != nil {
-				f.logger.Error("Cannot read corrupt tsm file, renaming", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
-				file.Close()
-				if e := os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension); e != nil {
-					f.logger.Error("Cannot rename corrupt tsm file", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(e))
-					readerC <- &res{r: df, err: fmt.Errorf("cannot rename corrupt file %s: %v", file.Name(), e)}
+				if cerr := file.Close(); cerr != nil {
+					f.logger.Error("Error closing TSM file after error", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(cerr))
+				}
+				if errors.Is(err, MmapError{}) {
+					// An MmapError may indicate we have insufficient
+					// handles for the mmap call, in which case the file should
+					// be left untouched, and the vm.max_map_count be raised.
+					f.logger.Error("Cannot read TSM file, system limit for vm.max_map_count may be too low",
+						zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
+					readerC <- &res{r: df, err: fmt.Errorf("cannot read file %s, system limit for vm.max_map_count may be too low: %w", file.Name(), err)}
+					return
+				} else {
+					// If the file is corrupt, rename it and
+					// continue loading the shard without it.
+					f.logger.Error("Cannot read corrupt tsm file, renaming", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
+					if e := os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension); e != nil {
+						f.logger.Error("Cannot rename corrupt tsm file", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(e))
+						readerC <- &res{r: df, err: fmt.Errorf("cannot rename corrupt file %s: %w", file.Name(), e)}
+						return
+					}
+					readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %w", file.Name(), err)}
 					return
 				}
-				readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %v", file.Name(), err)}
-				return
 			}
-
 			df.WithObserver(f.obs)
 			readerC <- &res{r: df}
 		}(i, file)
@@ -668,7 +683,7 @@ func (f *FileStore) Open(ctx context.Context) error {
 			f.lastModified = fi.ModTime().UTC()
 		} else {
 			close(readerC)
-			return err
+			return fmt.Errorf("error calling Stat on %q in FileStore.Open: %w", f.dir, err)
 		}
 	} else {
 		f.lastModified = time.Unix(0, lm).UTC()
@@ -916,7 +931,7 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 			}
 		}
 
-		tsm, err := NewTSMReader(fd, WithMadviseWillNeed(f.tsmMMAPWillNeed))
+		tsm, err := NewTSMReader(fd, f.readerOptions...)
 		if err != nil {
 			if newName != oldName {
 				if err1 := os.Rename(newName, oldName); err1 != nil {

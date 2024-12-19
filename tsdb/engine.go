@@ -29,7 +29,7 @@ var (
 // Engine represents a swappable storage engine for the shard.
 type Engine interface {
 	Open(ctx context.Context) error
-	Close() error
+	Close(flush bool) error
 	SetEnabled(enabled bool)
 	SetCompactionsEnabled(enabled bool)
 	ScheduleFullCompaction() error
@@ -126,14 +126,16 @@ func NewEngine(id uint64, i Index, path string, walPath string, sfile *SeriesFil
 			options.OnNewEngine(engine)
 		}
 		return engine, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("error getting file stats for %q in NewEngine: %w", path, err)
 	}
 
 	// If it's a dir then it's a tsm1 engine
 	format := DefaultEngine
 	if fi, err := os.Stat(path); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error calling Stat on %q in NewEngine: %w", path, err)
 	} else if !fi.Mode().IsDir() {
-		return nil, ErrUnknownEngineFormat
+		return nil, fmt.Errorf("error opening %q: %w", path, ErrUnknownEngineFormat)
 	} else {
 		format = "tsm1"
 	}
@@ -141,7 +143,7 @@ func NewEngine(id uint64, i Index, path string, walPath string, sfile *SeriesFil
 	// Lookup engine by format.
 	fn := newEngineFuncs[format]
 	if fn == nil {
-		return nil, fmt.Errorf("invalid engine format: %q", format)
+		return nil, fmt.Errorf("invalid engine format for %q: %q", path, format)
 	}
 
 	engine := fn(id, i, path, walPath, sfile, options)

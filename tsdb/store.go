@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,8 @@ import (
 )
 
 var (
+	// ErrIncompatibleWAL is returned if incompatible WAL files are detected.
+	ErrIncompatibleWAL = errors.New("incompatible WAL format")
 	// ErrShardNotFound is returned when trying to get a non existing shard.
 	ErrShardNotFound = fmt.Errorf("shard not found")
 	// ErrStoreClosed is returned when trying to use a closed Store.
@@ -49,6 +52,12 @@ const SeriesFileDirectory = "_series"
 
 // databaseState keeps track of the state of a database.
 type databaseState struct{ indexTypes map[string]int }
+
+// struct to hold the result of opening each reader in a goroutine
+type shardResponse struct {
+	s   *Shard
+	err error
+}
 
 // addIndexType records that the database has a shard with the given index type.
 func (d *databaseState) addIndexType(indexType string) {
@@ -82,7 +91,12 @@ func (se *shardErrorMap) setShardOpenError(shardID uint64, err error) {
 	if err == nil {
 		delete(se.shardErrors, shardID)
 	} else {
-		se.shardErrors[shardID] = &ErrPreviousShardFail{error: fmt.Errorf("opening shard previously failed with: %w", err)}
+		// Ignore incoming error if it is from a previous open failure. We don't want to keep
+		// re-wrapping the same error. For safety, make sure we have an ErrPreviousShardFail in
+		//  case we hadn't recorded it.
+		if !errors.Is(err, ErrPreviousShardFail{}) || !errors.Is(se.shardErrors[shardID], ErrPreviousShardFail{}) {
+			se.shardErrors[shardID] = &ErrPreviousShardFail{error: fmt.Errorf("opening shard previously failed with: %w", err)}
+		}
 	}
 }
 
@@ -118,6 +132,11 @@ type Store struct {
 	baseLogger *zap.Logger
 	Logger     *zap.Logger
 
+	startupProgressMetrics interface {
+		AddShard()
+		CompletedShard()
+	}
+
 	closing chan struct{}
 	wg      sync.WaitGroup
 	opened  bool
@@ -146,6 +165,13 @@ func (s *Store) WithLogger(log *zap.Logger) {
 	for _, sh := range s.shards {
 		sh.WithLogger(s.baseLogger)
 	}
+}
+
+func (s *Store) WithStartupMetrics(sp interface {
+	AddShard()
+	CompletedShard()
+}) {
+	s.startupProgressMetrics = sp
 }
 
 // CollectBucketMetrics sets prometheus metrics for each bucket
@@ -285,13 +311,213 @@ func (s *Store) Open(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) loadShards(ctx context.Context) error {
-	// res holds the result from opening each shard in a goroutine
-	type res struct {
-		s   *Shard
-		err error
+const (
+	wrrFileExtension     = "wrr"
+	wrrPrefixVersioned   = "_v"
+	wrrSnapshotExtension = "snapshot"
+)
+
+// generateWRRSegmentFileGlob generates a glob to find all .wrr and related files in a
+// WAL directory.
+func generateWRRSegmentFileGlob() string {
+	return fmt.Sprintf("%s*.%s*", wrrPrefixVersioned, wrrFileExtension)
+}
+
+// checkUncommittedWRR determines if there are any uncommitted WRR files found in shardWALPath.
+// shardWALPath is the path to a single shard's WAL, not the overall WAL path.
+// If no uncommitted WRR files are found, then nil is returned. Otherwise, an error indicating
+// the names of uncommitted WRR files is returned. The error returned contains the full context
+// and does not require additional information.
+func checkUncommittedWRR(shardWALPath string) error {
+	// It is OK if there are .wrr files as long as they are committed. Committed .wrr files will
+	// have a .wrr.snapshot newer than the .wrr file. If there is no .wrr.snapshot file newer
+	// than a given .wrr file, then that .wrr file is uncommitted and we should return an error
+	// indicating possible data loss due to an in-place conversion of an incompatible WAL format.
+	// Note that newness for .wrr and .wrr.snapshot files is determined lexically by the name,
+	// and not the ctime or mtime of the files.
+
+	unfilteredNames, err := filepath.Glob(filepath.Join(shardWALPath, generateWRRSegmentFileGlob()))
+	if err != nil {
+		return fmt.Errorf("error finding WRR files in %q: %w", shardWALPath, err)
+	}
+	snapshotExt := fmt.Sprintf(".%s.%s", wrrFileExtension, wrrSnapshotExtension)
+
+	// Strip out files that are not .wal or .wal.snapshot, given the glob pattern
+	// could include false positives, such as foo.wally or foo.wal.snapshotted
+	names := make([]string, 0, len(unfilteredNames))
+	for _, name := range unfilteredNames {
+		if strings.HasSuffix(name, wrrFileExtension) || strings.HasSuffix(name, snapshotExt) {
+			names = append(names, name)
+		}
 	}
 
+	sort.Strings(names)
+
+	// Find the last snapshot and collect the files after it
+	for i := len(names) - 1; i >= 0; i-- {
+		if strings.HasSuffix(names[i], snapshotExt) {
+			names = names[i+1:]
+			break
+		}
+	}
+
+	// names now contains a list of uncommitted WRR files.
+	if len(names) > 0 {
+		return fmt.Errorf("%w: uncommitted WRR files found: %v", ErrIncompatibleWAL, names)
+	}
+
+	return nil
+}
+
+// checkWALCompatibility ensures that an uncommitted WAL segments in an incompatible
+// format are not present. shardWALPath is the path to a single shard's WAL, not the
+// overall WAL path. A ErrIncompatibleWAL error with further details is returned if
+// an incompatible WAL with unflushed segments is found, The error returned contains
+// the full context and does not require additional information.
+func checkWALCompatibility(shardWALPath string) error {
+	// There is one known incompatible WAL format, the .wrr format. Finding these is a problem
+	// if they are uncommitted. OSS can not read .wrr WAL files, so any uncommitted data in them
+	// will be lost.
+	return checkUncommittedWRR(shardWALPath)
+}
+
+// generateTrailingPath returns the last part of a shard path or WAL path
+// based on the shardID, db, and rp.
+func (s *Store) generateTrailingPath(shardID uint64, db, rp string) string {
+	return filepath.Join(db, rp, strconv.FormatUint(shardID, 10))
+}
+
+// generatePath returns the path to a shard based on its db, rp, and shardID.
+func (s *Store) generatePath(shardID uint64, db, rp string) string {
+	return filepath.Join(s.path, s.generateTrailingPath(shardID, db, rp))
+}
+
+// generateWALPath returns the WAL path to a shard based on its db, rp, and shardID.
+func (s *Store) generateWALPath(shardID uint64, db, rp string) string {
+	return filepath.Join(s.EngineOptions.Config.WALDir, s.generateTrailingPath(shardID, db, rp))
+}
+
+// shardLoader is an independent object that can load shards from disk in a thread-safe manner.
+// It should be created with Store.newShardLoader. The result of shardLoader.Load should then
+// be registered with Store.registerShard.
+type shardLoader struct {
+	// NOTE: shardLoader should not directly reference the Store that creates it or any of its fields.
+
+	shardID    uint64
+	db         string
+	rp         string
+	sfile      *SeriesFile
+	engineOpts EngineOptions
+	enabled    bool
+	logger     *zap.Logger
+
+	// Shard we are working with. Could be created by the loader or given by client code.
+	shard *Shard
+
+	// Should be loaded even if loading failed previously?
+	force bool
+
+	// Path to shard on disk
+	path string
+
+	// Path to WAL on disk
+	walPath string
+
+	// loadErr indicates if Load should fail immediately with an error.
+	loadErr error
+}
+
+// Load loads a shard from disk in a thread-safe manner. After a call to Load,
+// the result must be registered with Store.registerShard, whether or not an error
+// occurred. The returned shard is guaranteed to not be nil and have the correct shard ID,
+// although it will not be properly loaded if there was an error.
+func (l *shardLoader) Load(ctx context.Context) *shardResponse {
+	// Open engine.
+	if l.shard == nil {
+		l.shard = NewShard(l.shardID, l.path, l.walPath, l.sfile, l.engineOpts)
+
+		// Set options based on caller preferences.
+		l.shard.EnableOnOpen = l.enabled
+		l.shard.CompactionDisabled = l.engineOpts.CompactionDisabled
+		l.shard.WithLogger(l.logger)
+	}
+
+	err := func() error {
+		// Stop and return error if previous open failed.
+		if l.loadErr != nil {
+			return l.loadErr
+		}
+
+		// Open the shard.
+		return l.shard.Open(ctx)
+	}()
+
+	return &shardResponse{s: l.shard, err: err}
+}
+
+type shardLoaderOption func(*shardLoader)
+
+// withForceLoad allows forcing shard opens even if a previous load failed with an error.
+func withForceLoad(force bool) shardLoaderOption {
+	return func(l *shardLoader) {
+		l.force = force
+	}
+}
+
+// withExistingShard uses an existing Shard already registered with Store instead
+// of creating a new one.
+func withExistingShard(shard *Shard) shardLoaderOption {
+	return func(l *shardLoader) {
+		l.shard = shard
+	}
+}
+
+// newShardLoader generates a shardLoader that can be used to load a shard in a
+// thread-safe manner. The result of the shardLoader.Load() must then be
+// populated into s using Store.registerShard.
+// s.mu must be held before calling newShardLoader. newShardLoader is not thread-safe.
+// Note that any errors detected during newShardLoader will not be returned to caller until
+// Load is called. This is to simplify error handling for client code.
+func (s *Store) newShardLoader(shardID uint64, db, rp string, enabled bool, opts ...shardLoaderOption) *shardLoader {
+	l := &shardLoader{
+		shardID:    shardID,
+		db:         db,
+		rp:         rp,
+		engineOpts: s.EngineOptions,
+		enabled:    enabled,
+		logger:     s.baseLogger,
+
+		path:    s.generatePath(shardID, db, rp),
+		walPath: s.generateWALPath(shardID, db, rp),
+	}
+
+	for _, o := range opts {
+		o(l)
+	}
+
+	// Check for error from last load attempt.
+	lastErr, _ := s.badShards.shardError(shardID)
+	if lastErr != nil && !l.force {
+		l.loadErr = fmt.Errorf("not attempting to open shard %d; %w", shardID, lastErr)
+		return l
+	}
+
+	// Provide an implementation of the ShardIDSets
+	l.engineOpts.SeriesIDSets = shardSet{store: s, db: db}
+
+	// Retrieve cached series file or load it if not cached in s.
+	sfile, err := s.openSeriesFile(db)
+	if err != nil {
+		l.loadErr = fmt.Errorf("error loading series file for database %q: %w", db, err)
+		return l
+	}
+	l.sfile = sfile
+
+	return l
+}
+
+// loadShards loads all shards on disk. s.mu must be held before calling loadShards.
+func (s *Store) loadShards(ctx context.Context) error {
 	// Limit the number of concurrent TSM files to be opened to the number of cores.
 	s.EngineOptions.OpenLimiter = limiter.NewFixed(runtime.GOMAXPROCS(0))
 
@@ -340,150 +566,72 @@ func (s *Store) loadShards(ctx context.Context) error {
 	defer logEnd()
 
 	t := limiter.NewFixed(runtime.GOMAXPROCS(0))
-	resC := make(chan *res)
-	var n int
 
-	// Determine how many shards we need to open by checking the store path.
-	dbDirs, err := os.ReadDir(s.path)
+	// Get list of shards and their db / rp.
+	shards, err := s.findShards(log)
 	if err != nil {
-		return err
+		return fmt.Errorf("error while finding shards to load: %w", err)
 	}
 
-	for _, db := range dbDirs {
-		dbPath := filepath.Join(s.path, db.Name())
-		if !db.IsDir() {
-			log.Info("Skipping database dir", zap.String("name", db.Name()), zap.String("reason", "not a directory"))
-			continue
-		}
-
-		if s.EngineOptions.DatabaseFilter != nil && !s.EngineOptions.DatabaseFilter(db.Name()) {
-			log.Info("Skipping database dir", logger.Database(db.Name()), zap.String("reason", "failed database filter"))
-			continue
-		}
-
-		// Load series file.
-		sfile, err := s.openSeriesFile(db.Name())
-		if err != nil {
-			return err
-		}
-
-		// Load each retention policy within the database directory.
-		rpDirs, err := os.ReadDir(dbPath)
-		if err != nil {
-			return err
-		}
-
-		for _, rp := range rpDirs {
-			rpPath := filepath.Join(s.path, db.Name(), rp.Name())
-			if !rp.IsDir() {
-				log.Info("Skipping retention policy dir", zap.String("name", rp.Name()), zap.String("reason", "not a directory"))
-				continue
-			}
-
-			// The .series directory is not a retention policy.
-			if rp.Name() == SeriesFileDirectory {
-				continue
-			}
-
-			if s.EngineOptions.RetentionPolicyFilter != nil && !s.EngineOptions.RetentionPolicyFilter(db.Name(), rp.Name()) {
-				log.Info("Skipping retention policy dir", logger.RetentionPolicy(rp.Name()), zap.String("reason", "failed retention policy filter"))
-				continue
-			}
-
-			shardDirs, err := os.ReadDir(rpPath)
-			if err != nil {
-				return err
-			}
-
-			for _, sh := range shardDirs {
-				// Series file should not be in a retention policy but skip just in case.
-				if sh.Name() == SeriesFileDirectory {
-					log.Warn("Skipping series file in retention policy dir", zap.String("path", filepath.Join(s.path, db.Name(), rp.Name())))
-					continue
-				}
-
-				n++
-				go func(db, rp, sh string) {
-					path := filepath.Join(s.path, db, rp, sh)
-					walPath := filepath.Join(s.EngineOptions.Config.WALDir, db, rp, sh)
-
-					if err := t.Take(ctx); err != nil {
-						log.Error("failed to open shard at path", zap.String("path", path), zap.Error(err))
-						resC <- &res{err: fmt.Errorf("failed to open shard at path %q: %w", path, err)}
-						return
-					}
-					defer t.Release()
-
-					start := time.Now()
-
-					// Shard file names are numeric shardIDs
-					shardID, err := strconv.ParseUint(sh, 10, 64)
-					if err != nil {
-						log.Error("invalid shard ID found at path", zap.String("path", path))
-						resC <- &res{err: fmt.Errorf("%s is not a valid ID. Skipping shard", sh)}
-						return
-					}
-
-					if s.EngineOptions.ShardFilter != nil && !s.EngineOptions.ShardFilter(db, rp, shardID) {
-						log.Warn("skipping shard", zap.String("path", path), logger.Shard(shardID))
-						resC <- &res{}
-						return
-					}
-
-					// Copy options and assign shared index.
-					opt := s.EngineOptions
-
-					// Provide an implementation of the ShardIDSets
-					opt.SeriesIDSets = shardSet{store: s, db: db}
-
-					// Open engine.
-					shard := NewShard(shardID, path, walPath, sfile, opt)
-
-					// Disable compactions, writes and queries until all shards are loaded
-					shard.EnableOnOpen = false
-					shard.CompactionDisabled = s.EngineOptions.CompactionDisabled
-					shard.WithLogger(s.baseLogger)
-
-					err = s.OpenShard(ctx, shard, false)
-					if err != nil {
-						log.Error("Failed to open shard", logger.Shard(shardID), zap.Error(err))
-						resC <- &res{err: fmt.Errorf("failed to open shard: %d: %s", shardID, err)}
-						return
-					}
-
-					resC <- &res{s: shard}
-					log.Info("Opened shard", zap.String("index_version", shard.IndexType()), zap.String("path", path), zap.Duration("duration", time.Since(start)))
-				}(db.Name(), rp.Name(), sh.Name())
-			}
+	// Setup progress metrics.
+	if s.startupProgressMetrics != nil {
+		for range shards {
+			s.startupProgressMetrics.AddShard()
 		}
 	}
 
-	// Gather results of opening shards concurrently, keeping track of how
-	// many databases we are managing.
-	for i := 0; i < n; i++ {
-		res := <-resC
-		if res.s == nil || res.err != nil {
-			continue
-		}
-		s.shards[res.s.id] = res.s
-		s.epochs[res.s.id] = newEpochTracker()
-		if _, ok := s.databases[res.s.database]; !ok {
-			s.databases[res.s.database] = new(databaseState)
-		}
-		s.databases[res.s.database].addIndexType(res.s.IndexType())
-	}
-	close(resC)
-
-	// Check if any databases are running multiple index types.
-	for db, state := range s.databases {
-		if state.hasMultipleIndexTypes() {
-			var fields []zapcore.Field
-			for idx, cnt := range state.indexTypes {
-				fields = append(fields, zap.Int(fmt.Sprintf("%s_count", idx), cnt))
+	// Verify no incompatible WAL files. Do this before starting to load shards to fail early if found.
+	// All shards are scanned instead of stopping at just the first one so that the admin will see
+	// all the problematic shards.
+	if s.EngineOptions.WALEnabled {
+		var errs []error
+		for _, sh := range shards {
+			if err := checkWALCompatibility(s.generateWALPath(sh.id, sh.db, sh.rp)); err != nil {
+				errs = append(errs, err)
 			}
-			s.Logger.Warn("Mixed shard index types", append(fields, logger.Database(db))...)
+		}
+		if len(errs) > 0 {
+			return errors.Join(errs...)
 		}
 	}
+
+	// Do the actual work of loading shards.
+	shardResC := make(chan *shardResponse, len(shards))
+	pendingShardCount := 0
+	for _, sh := range shards {
+		pendingShardCount++
+
+		// loader must be created serially for thread-safety, then they can be used in  parallel manner.
+		loader := s.newShardLoader(sh.id, sh.db, sh.rp, false)
+
+		// Now perform the actual loading in parallel in separate goroutines.
+		go func(log *zap.Logger) {
+			t.Take(ctx)
+			defer t.Release()
+
+			start := time.Now()
+			res := loader.Load(ctx)
+			if res.err == nil {
+				log.Info("Opened shard", zap.String("index_version", res.s.IndexType()), zap.Duration("duration", time.Since(start)))
+			} else {
+				log.Error("Failed to open shard", zap.Error(res.err))
+			}
+
+			shardResC <- res
+			if s.startupProgressMetrics != nil {
+				s.startupProgressMetrics.CompletedShard()
+			}
+		}(log.With(logger.Shard(sh.id), zap.String("path", loader.path)))
+	}
+
+	// Register shards serially as the parallel goroutines finish opening them.
+	for finishedShardCount := 0; finishedShardCount < pendingShardCount; finishedShardCount++ {
+		res := <-shardResC
+		s.registerShard(res)
+	}
+
+	// Check and log if any databases are running multiple index types.
+	s.warnMixedIndexTypes()
 
 	// Enable all shards
 	for _, sh := range s.shards {
@@ -496,6 +644,59 @@ func (s *Store) loadShards(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// registerShard registers a shardResponse from a shardLoader.Load operation with s.
+// registerShard should always be called with the result of shardLoader.Load, even if
+// the shard loading failed. This makes sure errors opening shards are properly tracked.
+// s.mu should be held before calling registerShard. registerShard is not thread-safe and
+// and should not be used in a paralell manner.
+func (s *Store) registerShard(res *shardResponse) {
+	if res.s == nil {
+		s.Logger.Error("registerShard called with nil")
+		return
+	}
+	if res.err != nil {
+		s.badShards.setShardOpenError(res.s.ID(), res.err)
+		return
+	}
+
+	// Avoid registering an already registered shard.
+	if s.shards[res.s.id] != res.s {
+		s.shards[res.s.id] = res.s
+		s.epochs[res.s.id] = newEpochTracker()
+		if _, ok := s.databases[res.s.database]; !ok {
+			s.databases[res.s.database] = new(databaseState)
+		}
+		s.databases[res.s.database].addIndexType(res.s.IndexType())
+	}
+}
+
+// warnMixedIndexTypes checks the databases listed in dbList for mixed
+// index types and logs warnings if any are found. If no dbList is given, then
+// all databases in s are checked.
+func (s *Store) warnMixedIndexTypes(dbList ...string) {
+	var dbStates map[string]*databaseState
+	if len(dbList) == 0 {
+		dbStates = s.databases
+	} else {
+		dbStates = make(map[string]*databaseState)
+		for _, db := range dbList {
+			if state, ok := s.databases[db]; ok {
+				dbStates[db] = state
+			}
+		}
+
+	}
+	for db, state := range dbStates {
+		if state.hasMultipleIndexTypes() {
+			var fields []zapcore.Field
+			for idx, cnt := range state.indexTypes {
+				fields = append(fields, zap.Int(fmt.Sprintf("%s_count", idx), cnt))
+			}
+			s.Logger.Warn("Mixed shard index types", append(fields, logger.Database(db))...)
+		}
+	}
 }
 
 // Close closes the store and all associated shards. After calling Close accessing
@@ -512,7 +713,11 @@ func (s *Store) Close() error {
 
 	// Close all the shards in parallel.
 	if err := s.walkShards(s.shardsSlice(), func(sh *Shard) error {
-		return sh.Close()
+		if s.EngineOptions.Config.WALFlushOnShutdown {
+			return sh.FlushAndClose()
+		} else {
+			return sh.Close()
+		}
 	}); err != nil {
 		return err
 	}
@@ -601,18 +806,20 @@ func (e ErrPreviousShardFail) Error() string {
 	return e.error.Error()
 }
 
-func (s *Store) OpenShard(ctx context.Context, sh *Shard, force bool) error {
+func (s *Store) ReopenShard(ctx context.Context, shardID uint64, force bool) error {
+	sh := s.Shard(shardID)
 	if sh == nil {
-		return errors.New("cannot open nil shard")
+		return ErrShardNotFound
 	}
-	oldErr, bad := s.badShards.shardError(sh.ID())
-	if force || !bad {
-		err := sh.Open(ctx)
-		s.badShards.setShardOpenError(sh.ID(), err)
-		return err
-	} else {
-		return oldErr
-	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	loader := s.newShardLoader(shardID, "", "", true, withExistingShard(sh), withForceLoad(force))
+	res := loader.Load(ctx)
+	s.registerShard(res)
+
+	return res.err
 }
 
 func (s *Store) SetShardOpenErrorForTest(shardID uint64, err error) {
@@ -690,40 +897,11 @@ func (s *Store) CreateShard(ctx context.Context, database, retentionPolicy strin
 		return err
 	}
 
-	// Retrieve database series file.
-	sfile, err := s.openSeriesFile(database)
-	if err != nil {
-		return err
-	}
-
-	// Copy index options and pass in shared index.
-	opt := s.EngineOptions
-	opt.SeriesIDSets = shardSet{store: s, db: database}
-
-	path := filepath.Join(s.path, database, retentionPolicy, strconv.FormatUint(shardID, 10))
-	shard := NewShard(shardID, path, walPath, sfile, opt)
-	shard.WithLogger(s.baseLogger)
-	shard.EnableOnOpen = enabled
-
-	if err := s.OpenShard(ctx, shard, false); err != nil {
-		return err
-	}
-
-	s.shards[shardID] = shard
-	s.epochs[shardID] = newEpochTracker()
-	if _, ok := s.databases[database]; !ok {
-		s.databases[database] = new(databaseState)
-	}
-	s.databases[database].addIndexType(shard.IndexType())
-	if state := s.databases[database]; state.hasMultipleIndexTypes() {
-		var fields []zapcore.Field
-		for idx, cnt := range state.indexTypes {
-			fields = append(fields, zap.Int(fmt.Sprintf("%s_count", idx), cnt))
-		}
-		s.Logger.Warn("Mixed shard index types", append(fields, logger.Database(database))...)
-	}
-
-	return nil
+	loader := s.newShardLoader(shardID, database, retentionPolicy, enabled)
+	res := loader.Load(ctx)
+	s.registerShard(res)
+	s.warnMixedIndexTypes(database)
+	return res.err
 }
 
 // CreateShardSnapShot will create a hard link to the underlying shard and return a path.
@@ -888,9 +1066,7 @@ func (s *Store) DeleteDatabase(name string) error {
 		// no files locally, so nothing to do
 		return nil
 	}
-	shards := s.filterShards(func(sh *Shard) bool {
-		return sh.database == name
-	})
+	shards := s.filterShards(byDatabase(name))
 	s.mu.RUnlock()
 
 	if err := s.walkShards(shards, func(sh *Shard) error {
@@ -952,9 +1128,7 @@ func (s *Store) DeleteRetentionPolicy(database, name string) error {
 		// unknown database, nothing to do
 		return nil
 	}
-	shards := s.filterShards(func(sh *Shard) bool {
-		return sh.database == database && sh.retentionPolicy == name
-	})
+	shards := s.filterShards(ComposeShardFilter(byDatabase(database), byRetentionPolicy(name)))
 	s.mu.RUnlock()
 
 	// Close and delete all shards under the retention policy on the
@@ -1048,6 +1222,20 @@ func (s *Store) filterShards(fn func(sh *Shard) bool) []*Shard {
 	return shards
 }
 
+type ShardPredicate = func(sh *Shard) bool
+
+func ComposeShardFilter(fns ...ShardPredicate) ShardPredicate {
+	return func(sh *Shard) bool {
+		for _, fn := range fns {
+			if !fn(sh) {
+				return false
+			}
+		}
+
+		return true
+	}
+}
+
 // byDatabase provides a predicate for filterShards that matches on the name of
 // the database passed in.
 func byDatabase(name string) func(sh *Shard) bool {
@@ -1056,16 +1244,20 @@ func byDatabase(name string) func(sh *Shard) bool {
 	}
 }
 
+// byRetentionPolicy provides a predicate for filterShards that matches on the name of
+// the retention policy passed in.
+func byRetentionPolicy(name string) ShardPredicate {
+	return func(sh *Shard) bool {
+		return sh.retentionPolicy == name
+	}
+}
+
 // walkShards apply a function to each shard in parallel. fn must be safe for
 // concurrent use. If any of the functions return an error, the first error is
 // returned.
 func (s *Store) walkShards(shards []*Shard, fn func(sh *Shard) error) error {
-	// struct to hold the result of opening each reader in a goroutine
-	type res struct {
-		err error
-	}
 
-	resC := make(chan res)
+	resC := make(chan shardResponse, len(shards))
 	var n int
 
 	for _, sh := range shards {
@@ -1073,11 +1265,11 @@ func (s *Store) walkShards(shards []*Shard, fn func(sh *Shard) error) error {
 
 		go func(sh *Shard) {
 			if err := fn(sh); err != nil {
-				resC <- res{err: fmt.Errorf("shard %d: %s", sh.id, err)}
+				resC <- shardResponse{err: fmt.Errorf("shard %d: %s", sh.id, err)}
 				return
 			}
 
-			resC <- res{}
+			resC <- shardResponse{}
 		}(sh)
 	}
 
@@ -2187,4 +2379,112 @@ func (s shardSet) ForEach(f func(ids *SeriesIDSet)) error {
 		f(idx.SeriesIDSet())
 	}
 	return nil
+}
+
+type shardInfo struct {
+	id uint64
+	db string
+	rp string
+}
+
+// findShards returns a list of all shards and their db / rp that are found
+// in s.path.
+func (s *Store) findShards(log *zap.Logger) ([]shardInfo, error) {
+	var shards []shardInfo
+
+	// Determine how many shards we need to open by checking the store path.
+	dbDirs, err := os.ReadDir(s.path)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, db := range dbDirs {
+		rpDirs, err := s.getRetentionPolicyDirs(db, log)
+		if err != nil {
+			return nil, err
+		} else if rpDirs == nil {
+			continue
+		}
+
+		for _, rp := range rpDirs {
+			shardDirs, err := s.getShards(rp, db, log)
+			if err != nil {
+				return nil, err
+			} else if shardDirs == nil {
+				continue
+			}
+
+			for _, sh := range shardDirs {
+				fullPath := filepath.Join(s.path, db.Name(), rp.Name())
+
+				// Series file should not be in a retention policy but skip just in case.
+				if sh.Name() == SeriesFileDirectory {
+					log.Warn("Skipping series file in retention policy dir", zap.String("path", fullPath))
+					continue
+				}
+
+				// Shard file names are numeric shardIDs
+				shardID, err := strconv.ParseUint(sh.Name(), 10, 64)
+				if err != nil {
+					log.Warn("invalid shard ID found at path", zap.String("path", fullPath))
+					continue
+				}
+
+				if s.EngineOptions.ShardFilter != nil && !s.EngineOptions.ShardFilter(db.Name(), rp.Name(), shardID) {
+					log.Info("skipping shard", zap.String("path", fullPath), logger.Shard(shardID))
+					continue
+				}
+
+				shards = append(shards, shardInfo{id: shardID, db: db.Name(), rp: rp.Name()})
+			}
+		}
+	}
+
+	return shards, nil
+}
+
+func (s *Store) getRetentionPolicyDirs(db os.DirEntry, log *zap.Logger) ([]os.DirEntry, error) {
+	dbPath := filepath.Join(s.path, db.Name())
+	if !db.IsDir() {
+		log.Info("Skipping database dir", zap.String("name", db.Name()), zap.String("reason", "not a directory"))
+		return nil, nil
+	}
+
+	if s.EngineOptions.DatabaseFilter != nil && !s.EngineOptions.DatabaseFilter(db.Name()) {
+		log.Info("Skipping database dir", logger.Database(db.Name()), zap.String("reason", "failed database filter"))
+		return nil, nil
+	}
+
+	// Load each retention policy within the database directory.
+	rpDirs, err := os.ReadDir(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return rpDirs, nil
+}
+
+func (s *Store) getShards(rpDir os.DirEntry, dbDir os.DirEntry, log *zap.Logger) ([]os.DirEntry, error) {
+	rpPath := filepath.Join(s.path, dbDir.Name(), rpDir.Name())
+	if !rpDir.IsDir() {
+		log.Info("Skipping retention policy dir", zap.String("name", rpDir.Name()), zap.String("reason", "not a directory"))
+		return nil, nil
+	}
+
+	// The .series directory is not a retention policy.
+	if rpDir.Name() == SeriesFileDirectory {
+		return nil, nil
+	}
+
+	if s.EngineOptions.RetentionPolicyFilter != nil && !s.EngineOptions.RetentionPolicyFilter(dbDir.Name(), rpDir.Name()) {
+		log.Info("Skipping retention policy dir", logger.RetentionPolicy(rpDir.Name()), zap.String("reason", "failed retention policy filter"))
+		return nil, nil
+	}
+
+	shardDirs, err := os.ReadDir(rpPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return shardDirs, nil
 }

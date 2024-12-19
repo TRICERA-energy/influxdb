@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"math/rand"
 	"os"
@@ -18,14 +19,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/v2/predicate"
-
 	"github.com/davecgh/go-spew/spew"
 	"github.com/influxdata/influxdb/v2/influxql/query"
 	"github.com/influxdata/influxdb/v2/internal"
 	"github.com/influxdata/influxdb/v2/models"
 	"github.com/influxdata/influxdb/v2/pkg/deep"
 	"github.com/influxdata/influxdb/v2/pkg/slices"
+	"github.com/influxdata/influxdb/v2/pkg/snowflake"
+	"github.com/influxdata/influxdb/v2/predicate"
 	"github.com/influxdata/influxdb/v2/tsdb"
 	"github.com/influxdata/influxql"
 	"github.com/stretchr/testify/require"
@@ -144,28 +145,126 @@ func TestStore_CreateShard(t *testing.T) {
 	}
 }
 
+// Ensure the store can create a new shard.
+func TestStore_StartupShardProgress(t *testing.T) {
+	t.Parallel()
+
+	test := func(index string) {
+		s := MustOpenStore(t, index)
+		defer s.Close()
+
+		// Create a new shard and verify that it exists.
+		require.NoError(t, s.CreateShard(context.Background(), "db0", "rp0", 1, true))
+		sh := s.Shard(1)
+		require.NotNil(t, sh)
+
+		// Create another shard and verify that it exists.
+		require.NoError(t, s.CreateShard(context.Background(), "db0", "rp0", 2, true))
+		sh = s.Shard(2)
+		require.NotNil(t, sh)
+
+		msl := &mockStartupLogger{}
+
+		// Reopen shard and recheck.
+		require.NoError(t, s.Reopen(t, WithStartupMetrics(msl)))
+
+		// Equality check to make sure shards are always added prior to
+		// completion being called. This test opens 3 total shards - 1 shard
+		// fails, but we still want to track that it was attempted to be opened.
+		require.Equal(t, msl.Tracked(), []string{
+			"shard-add",
+			"shard-add",
+			"shard-complete",
+			"shard-complete",
+		})
+	}
+
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run(index, func(t *testing.T) { test(index) })
+	}
+}
+
+// Introduces a test to ensure that shard loading still accounts for bad shards. We still want these to show up
+// during the initial shard loading even though its in a error state.
+func TestStore_BadShardLoading(t *testing.T) {
+	t.Parallel()
+
+	test := func(index string) {
+		s := MustOpenStore(t, index)
+		defer s.Close()
+
+		// Create a new shard and verify that it exists.
+		require.NoError(t, s.CreateShard(context.Background(), "db0", "rp0", 1, true))
+		sh := s.Shard(1)
+		require.NotNil(t, sh)
+
+		// Create another shard and verify that it exists.
+		require.NoError(t, s.CreateShard(context.Background(), "db0", "rp0", 2, true))
+		sh = s.Shard(2)
+		require.NotNil(t, sh)
+
+		// Create another shard and verify that it exists.
+		require.NoError(t, s.CreateShard(context.Background(), "db0", "rp0", 3, true))
+		sh = s.Shard(3)
+		require.NotNil(t, sh)
+
+		s.SetShardOpenErrorForTest(sh.ID(), errors.New("a shard opening error occurred"))
+		err2 := s.ReopenShard(context.Background(), sh.ID(), false)
+		require.Error(t, err2, "no error opening bad shard")
+
+		msl := &mockStartupLogger{}
+
+		// Reopen shard and recheck.
+		require.NoError(t, s.Reopen(t, WithStartupMetrics(msl)))
+
+		// Equality check to make sure shards are always added prior to
+		// completion being called. This test opens 3 total shards - 1 shard
+		// fails, but we still want to track that it was attempted to be opened.
+		require.Equal(t, msl.Tracked(), []string{
+			"shard-add",
+			"shard-add",
+			"shard-add",
+			"shard-complete",
+			"shard-complete",
+			"shard-complete",
+		})
+	}
+
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run(index, func(t *testing.T) { test(index) })
+	}
+}
+
 func TestStore_BadShard(t *testing.T) {
 	const errStr = "a shard open error"
 	indexes := tsdb.RegisteredIndexes()
 	for _, idx := range indexes {
 		func() {
 			s := MustOpenStore(t, idx)
-			defer require.NoErrorf(t, s.Close(), "closing store with index type: %s", idx)
+			defer func() {
+				require.NoErrorf(t, s.Close(), "closing store with index type: %s", idx)
+			}()
 
-			sh := tsdb.NewTempShard(t, idx)
-			err := s.OpenShard(context.Background(), sh.Shard, false)
+			var shId uint64 = 1
+			require.NoError(t, s.CreateShard(context.Background(), "db0", "rp0", shId, true))
+			err := s.ReopenShard(context.Background(), shId, false)
 			require.NoError(t, err, "opening temp shard")
-			require.NoError(t, sh.Close(), "closing temporary shard")
 
-			s.SetShardOpenErrorForTest(sh.ID(), errors.New(errStr))
-			err2 := s.OpenShard(context.Background(), sh.Shard, false)
+			expErr := errors.New(errStr)
+			s.SetShardOpenErrorForTest(shId, expErr)
+			err2 := s.ReopenShard(context.Background(), shId, false)
 			require.Error(t, err2, "no error opening bad shard")
 			require.True(t, errors.Is(err2, tsdb.ErrPreviousShardFail{}), "exp: ErrPreviousShardFail, got: %v", err2)
-			require.EqualError(t, err2, "opening shard previously failed with: "+errStr)
+			require.EqualError(t, err2, fmt.Errorf("not attempting to open shard %d; opening shard previously failed with: %w", shId, expErr).Error())
+
+			// make sure we didn't modify the shard open error when we tried to reopen it
+			err2 = s.ReopenShard(context.Background(), shId, false)
+			require.Error(t, err2, "no error opening bad shard")
+			require.True(t, errors.Is(err2, tsdb.ErrPreviousShardFail{}), "exp: ErrPreviousShardFail, got: %v", err2)
+			require.EqualError(t, err2, fmt.Errorf("not attempting to open shard %d; opening shard previously failed with: %w", shId, expErr).Error())
 
 			// This should succeed with the force (and because opening an open shard automatically succeeds)
-			require.NoError(t, s.OpenShard(context.Background(), sh.Shard, true), "forced re-opening previously failing shard")
-			require.NoError(t, sh.Close())
+			require.NoError(t, s.ReopenShard(context.Background(), shId, true), "forced re-opening previously failing shard")
 		}()
 	}
 }
@@ -486,6 +585,7 @@ func TestStore_Open_InvalidDatabaseFile(t *testing.T) {
 		defer s.Close()
 
 		// Create a file instead of a directory for a database.
+		require.NoError(t, os.MkdirAll(s.Path(), 0777))
 		f, err := os.Create(filepath.Join(s.Path(), "db0"))
 		if err != nil {
 			t.Fatal(err)
@@ -651,6 +751,255 @@ func TestShards_CreateIterator(t *testing.T) {
 
 	for _, index := range tsdb.RegisteredIndexes() {
 		t.Run(index, func(t *testing.T) { test(t, index) })
+	}
+}
+
+func requireFloatIteratorPoints(t *testing.T, fitr query.FloatIterator, expPts []*query.FloatPoint) {
+	for idx, expPt := range expPts {
+		pt, err := fitr.Next()
+		require.NoError(t, err, "Got error on index=%d", idx)
+		require.Equal(t, expPt, pt, "Mismatch on index=%d", idx)
+	}
+	pt, err := fitr.Next()
+	require.NoError(t, err)
+	require.Nil(t, pt)
+}
+
+func walFiles(t *testing.T, s *Store) []string {
+	// Make sure the WAL directory is really there so we don't get false empties because
+	// the path calcuation is wrong or a cleanup routine blew away the whole WAL directory.
+	require.DirExists(t, s.walPath)
+	var dirs, files []string
+	err := filepath.Walk(s.walPath, func(path string, info fs.FileInfo, err error) error {
+		if info.IsDir() {
+			dirs = append(dirs, path)
+		} else {
+			files = append(files, path)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, dirs, "expected shard WAL directories, none found")
+	return files
+}
+
+func TestStore_FlushWALOnClose(t *testing.T) {
+
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run("TestStore_FlushWALOnClose_"+index, func(t *testing.T) {
+			s := MustOpenStore(t, index, WithWALFlushOnShutdown(true))
+			defer s.Close()
+
+			// Create shard #0 with data.
+			s.MustCreateShardWithData("db0", "rp0", 0,
+				`cpu,host=serverA value=1  0`,
+				`cpu,host=serverA value=2 10`,
+				`cpu,host=serverB value=3 20`,
+			)
+
+			// Create shard #1 with data.
+			s.MustCreateShardWithData("db0", "rp0", 1,
+				`cpu,host=serverA value=1 30`,
+				`mem,host=serverA value=2 40`, // skip: wrong source
+				`cpu,host=serverC value=3 60`,
+			)
+			expPts := []*query.FloatPoint{
+				&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverA"), Time: time.Unix(0, 0).UnixNano(), Value: 1},
+				&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverA"), Time: time.Unix(10, 0).UnixNano(), Value: 2},
+				&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverA"), Time: time.Unix(30, 0).UnixNano(), Value: 1},
+				&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverB"), Time: time.Unix(20, 0).UnixNano(), Value: 3},
+				&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverC"), Time: time.Unix(60, 0).UnixNano(), Value: 3},
+			}
+
+			require.NotEmpty(t, walFiles(t, s))
+
+			checkPoints := func(exp []*query.FloatPoint) {
+				// Retrieve shard group.
+				shards := s.ShardGroup([]uint64{0, 1})
+				// Create iterator.
+				m := &influxql.Measurement{Name: "cpu"}
+				itr, err := shards.CreateIterator(context.Background(), m, query.IteratorOptions{
+					Expr:       influxql.MustParseExpr(`value`),
+					Dimensions: []string{"host"},
+					Ascending:  true,
+					StartTime:  influxql.MinTime,
+					EndTime:    influxql.MaxTime,
+				})
+				require.NoError(t, err)
+				require.NotNil(t, itr)
+				defer itr.Close()
+				fitr, ok := itr.(query.FloatIterator)
+				require.True(t, ok)
+				requireFloatIteratorPoints(t, fitr, exp)
+			}
+			checkPoints(expPts)
+
+			require.NoError(t, s.Close())
+			s.Store = nil
+			require.Empty(t, walFiles(t, s))
+
+			require.NoError(t, s.Reopen(t))
+			checkPoints(expPts)
+			require.Empty(t, walFiles(t, s)) // we haven't written any points, no WAL yet.
+			s.MustWriteToShardString(1, `cpu,host=serverC value=5 90`)
+			expPts = append(expPts, &query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverC"), Time: time.Unix(90, 0).UnixNano(), Value: 5})
+			checkPoints(expPts)
+			require.NotEmpty(t, walFiles(t, s)) // we create a WAL file with the write
+
+			// One shard has a WAL, one does not
+			require.NoError(t, s.Close())
+			s.Store = nil
+			require.Empty(t, walFiles(t, s))
+
+			// Open again
+			require.NoError(t, s.Reopen(t))
+			checkPoints(expPts)
+			require.Empty(t, walFiles(t, s))
+
+			// Close with no writes, no WAL files
+			require.NoError(t, s.Close())
+			s.Store = nil
+			require.Empty(t, walFiles(t, s))
+
+			// Open again, but this time don't flush WAL on shutdown
+			require.NoError(t, s.Reopen(t, WithWALFlushOnShutdown(false)))
+			checkPoints(expPts)
+			require.Empty(t, walFiles(t, s))
+
+			// Write new point, creating WAL on one shard
+			s.MustWriteToShardString(1, `cpu,host=serverC value=6 100`)
+			expPts = append(expPts, &query.FloatPoint{Name: "cpu", Tags: ParseTags("host=serverC"), Time: time.Unix(100, 0).UnixNano(), Value: 6})
+			checkPoints(expPts)
+			require.NotEmpty(t, walFiles(t, s)) // we create a WAL file with the write
+
+			// Close and check that the shard is not flushed
+			require.NoError(t, s.Close())
+			s.Store = nil
+			require.NotEmpty(t, walFiles(t, s))
+
+			// Let's make sure we /really/ didn't flush the WAL by deleting the WAL and then making sure that last point we wrote has gone missing.
+			require.NoError(t, os.RemoveAll(s.walPath))
+			require.NoError(t, s.Reopen(t))
+			expPts = expPts[:len(expPts)-1]
+			checkPoints(expPts)
+			require.Empty(t, walFiles(t, s)) // also sanity checks that WAL directories have been recreated
+		})
+	}
+}
+
+func TestStore_WRRSegments(t *testing.T) {
+	// Check if uncommitted WRR segments are identified and cause opening the store to abort.
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run("TestStore_WRRSegments_"+index, func(t *testing.T) {
+			idGen := snowflake.New(0)
+			generateWRRSegmentName := func() string {
+				return fmt.Sprintf("_v01_%020d.wrr", idGen.Next())
+			}
+			createFile := func(t *testing.T, fn string) {
+				t.Helper()
+				require.NoError(t, os.WriteFile(fn, nil, 0666))
+			}
+			createWRR := func(t *testing.T, path string) string {
+				t.Helper()
+				fn := filepath.Join(path, generateWRRSegmentName())
+				createFile(t, fn)
+				return fn
+			}
+			generateWRRSnapshotName := func() string {
+				return generateWRRSegmentName() + ".snapshot"
+			}
+			createWRRSnapshot := func(t *testing.T, path string) string {
+				t.Helper()
+				fn := filepath.Join(path, generateWRRSnapshotName())
+				createFile(t, fn)
+				return fn
+			}
+			checkWRRError := func(t *testing.T, err error, wrrs ...[]string) {
+				t.Helper()
+				require.ErrorIs(t, err, tsdb.ErrIncompatibleWAL)
+				require.ErrorContains(t, err, "incompatible WAL format: uncommitted WRR files found")
+				// We don't know the exact order of the errors if there are multiple shards with
+				// uncommitted WRRs, but this will insure that all of them are included in the error
+				// message.
+				for _, w := range wrrs {
+					if len(w) > 0 {
+						require.ErrorContains(t, err, fmt.Sprintf("%v", w))
+					}
+				}
+			}
+
+			s := MustOpenStore(t, index, WithWALFlushOnShutdown(true))
+			defer s.Close()
+
+			// Create shard #0 with data.
+			s.MustCreateShardWithData("db0", "rp0", 0,
+				`cpu,host=serverA value=1  0`,
+				`cpu,host=serverA value=2 10`,
+				`cpu,host=serverB value=3 20`,
+			)
+
+			// Create shard #1 with data.
+			s.MustCreateShardWithData("db0", "rp0", 1,
+				`cpu,host=serverA value=1 30`,
+				`cpu,host=serverC value=3 60`,
+			)
+
+			sh0WALPath := filepath.Join(s.walPath, "db0", "rp0", "0")
+			require.DirExists(t, sh0WALPath)
+			sh1WALPath := filepath.Join(s.walPath, "db0", "rp0", "1")
+			require.DirExists(t, sh1WALPath)
+
+			// No WRR segments, no error
+			require.NoError(t, s.Reopen(t))
+
+			// 1 uncommitted WRR segment in shard 0
+			var sh0Uncommitted, sh1Uncommitted []string
+			checkReopen := func(t *testing.T) {
+				t.Helper()
+				allUncommitted := [][]string{sh0Uncommitted, sh1Uncommitted}
+				var hasUncommitted bool
+				for _, u := range allUncommitted {
+					if len(u) > 0 {
+						hasUncommitted = true
+					}
+				}
+
+				if hasUncommitted {
+					checkWRRError(t, s.Reopen(t), allUncommitted...)
+				} else {
+					require.NoError(t, s.Reopen(t))
+				}
+			}
+			sh0Uncommitted = append(sh0Uncommitted, createWRR(t, sh0WALPath))
+			checkReopen(t)
+
+			// 2 uncommitted WRR segments in shard 0
+			sh0Uncommitted = append(sh0Uncommitted, createWRR(t, sh0WALPath))
+			checkReopen(t)
+
+			// 2 uncommitted WR segments in shard 0, 1 in shard 1
+			sh1Uncommitted = append(sh1Uncommitted, createWRR(t, sh1WALPath))
+			checkReopen(t)
+
+			// No uncommitted WRR in shard 0, 1 in shard 1
+			createWRRSnapshot(t, sh0WALPath)
+			sh0Uncommitted = nil
+			checkReopen(t)
+
+			// No uncommitted WRR segments
+			createWRRSnapshot(t, sh1WALPath)
+			sh1Uncommitted = nil
+			checkReopen(t)
+
+			// Add 1 uncommitted to shard 1
+			sh1Uncommitted = append(sh1Uncommitted, createWRR(t, sh1WALPath))
+			checkReopen(t)
+
+			// No uncommitted WRR segments
+			createWRRSnapshot(t, sh1WALPath)
+			sh1Uncommitted = nil
+			checkReopen(t)
+		})
 	}
 }
 
@@ -1968,7 +2317,7 @@ func TestStore_MeasurementNames_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := s.OpenShard(context.Background(), sh, false); err != nil {
+						if err := s.ReopenShard(context.Background(), sh.ID(), false); err != nil {
 							errC <- err
 							return
 						}
@@ -2053,7 +2402,7 @@ func TestStore_TagKeys_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := s.OpenShard(context.Background(), sh, false); err != nil {
+						if err := s.ReopenShard(context.Background(), sh.ID(), false); err != nil {
 							errC <- err
 							return
 						}
@@ -2144,7 +2493,7 @@ func TestStore_TagValues_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := s.OpenShard(context.Background(), sh, false); err != nil {
+						if err := s.ReopenShard(context.Background(), sh.ID(), false); err != nil {
 							errC <- err
 							return
 						}
@@ -2471,30 +2820,64 @@ func BenchmarkStore_TagValues(b *testing.B) {
 // Store is a test wrapper for tsdb.Store.
 type Store struct {
 	*tsdb.Store
-	index string
+	path    string
+	index   string
+	walPath string
+	opts    []StoreOption
+}
+
+type StoreOption func(s *Store) error
+
+func WithWALFlushOnShutdown(flush bool) StoreOption {
+	return func(s *Store) error {
+		s.EngineOptions.Config.WALFlushOnShutdown = flush
+		return nil
+	}
+}
+
+func WithStartupMetrics(sm *mockStartupLogger) StoreOption {
+	return func(s *Store) error {
+		s.WithStartupMetrics(sm)
+		return nil
+	}
 }
 
 // NewStore returns a new instance of Store with a temporary path.
-func NewStore(tb testing.TB, index string) *Store {
+func NewStore(tb testing.TB, index string, opts ...StoreOption) *Store {
 	tb.Helper()
 
-	path := tb.TempDir()
+	// The WAL directory must not be rooted under the data path. Otherwise reopening
+	// the store will generate series indices for the WAL directories.
+	rootPath := tb.TempDir()
+	path := filepath.Join(rootPath, "data")
+	walPath := filepath.Join(rootPath, "wal")
 
-	s := &Store{Store: tsdb.NewStore(path), index: index}
+	s := &Store{
+		Store:   tsdb.NewStore(path),
+		path:    path,
+		index:   index,
+		walPath: walPath,
+		opts:    opts,
+	}
 	s.EngineOptions.IndexVersion = index
-	s.EngineOptions.Config.WALDir = filepath.Join(path, "wal")
+	s.EngineOptions.Config.WALDir = walPath
 	s.EngineOptions.Config.TraceLoggingEnabled = true
 	s.WithLogger(zaptest.NewLogger(tb))
+
+	for _, o := range s.opts {
+		err := o(s)
+		require.NoError(tb, err)
+	}
 
 	return s
 }
 
 // MustOpenStore returns a new, open Store using the specified index,
 // at a temporary path.
-func MustOpenStore(tb testing.TB, index string) *Store {
+func MustOpenStore(tb testing.TB, index string, opts ...StoreOption) *Store {
 	tb.Helper()
 
-	s := NewStore(tb, index)
+	s := NewStore(tb, index, opts...)
 
 	if err := s.Open(context.Background()); err != nil {
 		panic(err)
@@ -2503,25 +2886,38 @@ func MustOpenStore(tb testing.TB, index string) *Store {
 }
 
 // Reopen closes and reopens the store as a new store.
-func (s *Store) Reopen(tb testing.TB) error {
+func (s *Store) Reopen(tb testing.TB, newOpts ...StoreOption) error {
 	tb.Helper()
 
-	if err := s.Store.Close(); err != nil {
-		return err
+	if s.Store != nil {
+		if err := s.Store.Close(); err != nil {
+			return err
+		}
 	}
 
-	s.Store = tsdb.NewStore(s.Path())
+	s.Store = tsdb.NewStore(s.path)
 	s.EngineOptions.IndexVersion = s.index
-	s.EngineOptions.Config.WALDir = filepath.Join(s.Path(), "wal")
+	s.EngineOptions.Config.WALDir = s.walPath
 	s.EngineOptions.Config.TraceLoggingEnabled = true
 	s.WithLogger(zaptest.NewLogger(tb))
+	if len(newOpts) > 0 {
+		s.opts = newOpts
+	}
+
+	for _, o := range s.opts {
+		err := o(s)
+		require.NoError(tb, err)
+	}
 
 	return s.Store.Open(context.Background())
 }
 
 // Close closes the store and removes the underlying data.
 func (s *Store) Close() error {
-	return s.Store.Close()
+	if s.Store != nil {
+		return s.Store.Close()
+	}
+	return nil
 }
 
 // MustCreateShardWithData creates a shard and writes line protocol data to it.
@@ -2589,4 +2985,32 @@ func dirExists(path string) bool {
 		return true
 	}
 	return !os.IsNotExist(err)
+}
+
+type mockStartupLogger struct {
+	// mu protects all following members.
+	mu sync.Mutex
+
+	_shardTracker []string
+}
+
+func (m *mockStartupLogger) AddShard() {
+	m.mu.Lock()
+	m._shardTracker = append(m._shardTracker, "shard-add")
+	m.mu.Unlock()
+}
+
+func (m *mockStartupLogger) CompletedShard() {
+	m.mu.Lock()
+	m._shardTracker = append(m._shardTracker, "shard-complete")
+	m.mu.Unlock()
+}
+
+func (m *mockStartupLogger) Tracked() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	tracked := make([]string, len(m._shardTracker))
+	copy(tracked, m._shardTracker)
+	return tracked
 }

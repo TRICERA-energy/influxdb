@@ -584,6 +584,14 @@ func (l *WAL) CloseSegment() error {
 	return nil
 }
 
+// CloseAllSegments closes the current segment regardless of whether it contains data
+// and does not open a new one.
+func (l *WAL) CloseAllSegments() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closeCurrentSegmentFile()
+}
+
 // Delete deletes the given keys, returning the segment ID for the operation.
 func (l *WAL) Delete(ctx context.Context, keys [][]byte) (int, error) {
 	if len(keys) == 0 {
@@ -650,23 +658,33 @@ func (l *WAL) Close() error {
 
 // segmentFileNames will return all files that are WAL segment files in sorted order by ascending ID.
 func segmentFileNames(dir string) ([]string, error) {
-	names, err := filepath.Glob(filepath.Join(dir, fmt.Sprintf("%s*.%s", WALFilePrefix, WALFileExtension)))
+	pattern := filepath.Join(dir, fmt.Sprintf("%s*.%s", WALFilePrefix, WALFileExtension))
+	names, err := filepath.Glob(pattern)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("segmentFileNames: error in Glob for %q: %w", pattern, err)
 	}
 	sort.Strings(names)
 	return names, nil
 }
 
-// newSegmentFile will close the current segment file and open a new one, updating bookkeeping info on the log.
-func (l *WAL) newSegmentFile() error {
-	l.currentSegmentID++
+// closeCurrentSegmentFile will close the current segment file. l.mu must be held before calling this method.
+func (l *WAL) closeCurrentSegmentFile() error {
 	if l.currentSegmentWriter != nil {
 		l.sync()
 
 		if err := l.currentSegmentWriter.close(); err != nil {
 			return err
 		}
+		l.currentSegmentWriter = nil
+	}
+	return nil
+}
+
+// newSegmentFile will close the current segment file and open a new one, updating bookkeeping info on the log.
+func (l *WAL) newSegmentFile() error {
+	l.currentSegmentID++
+	if err := l.closeCurrentSegmentFile(); err != nil {
+		return err
 	}
 
 	fileName := filepath.Join(l.path, fmt.Sprintf("%s%05d.%s", WALFilePrefix, l.currentSegmentID, WALFileExtension))

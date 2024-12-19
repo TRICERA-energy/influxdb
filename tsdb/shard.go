@@ -94,6 +94,11 @@ func (e ShardError) Error() string {
 	return fmt.Sprintf("[shard %d] %s", e.id, e.Err)
 }
 
+// Unwrap returns the underlying error.
+func (e ShardError) Unwrap() error {
+	return e.Err
+}
+
 // PartialWriteError indicates a write request could only write a portion of the
 // requested values.
 type PartialWriteError struct {
@@ -491,7 +496,7 @@ func (s *Shard) openNoLock(ctx context.Context) (bool, error) {
 
 		return nil
 	}(); err != nil {
-		s.closeNoLock()
+		s.closeNoLock(false)
 		return true, NewShardError(s.id, err)
 	}
 
@@ -503,12 +508,18 @@ func (s *Shard) openNoLock(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// Close shuts down the shard's store.
-func (s *Shard) Close() error {
+// FlushAndClose flushes the shard's WAL and then closes down the shard's store.
+func (s *Shard) FlushAndClose() error {
+	return s.closeAndWait(true)
+}
+
+// closeAndWait shuts down the shard's store and waits for the close to complete.
+// If flush is true, the WAL is flushed and cleared before closing.
+func (s *Shard) closeAndWait(flush bool) error {
 	err := func() error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.closeNoLock()
+		return s.closeNoLock(flush)
 	}()
 	// make sure not to hold a lock while waiting for close to finish
 	werr := s.closeWait()
@@ -517,12 +528,19 @@ func (s *Shard) Close() error {
 		return err
 	}
 	return werr
+
+}
+
+// Close shuts down the shard's store.
+func (s *Shard) Close() error {
+	return s.closeAndWait(false)
 }
 
 // closeNoLock closes the shard an removes reference to the shard from associated
-// indexes. The s.mu mutex must be held before calling closeNoLock. closeWait should always
+// indexes. If flush is true, the WAL is flushed and cleared before closing.
+// The s.mu mutex must be held before calling closeNoLock. closeWait should always
 // be called after calling closeNoLock.
-func (s *Shard) closeNoLock() error {
+func (s *Shard) closeNoLock(flush bool) error {
 	if s._engine == nil {
 		return nil
 	}
@@ -531,7 +549,7 @@ func (s *Shard) closeNoLock() error {
 		close(s.metricUpdater.closing)
 	}
 
-	err := s._engine.Close()
+	err := s._engine.Close(flush)
 	if err == nil {
 		s._engine = nil
 	}
@@ -1266,7 +1284,7 @@ func (s *Shard) Restore(ctx context.Context, r io.Reader, basePath string) error
 
 		// Close shard.
 		closeWaitNeeded = true // about to call closeNoLock, closeWait will be needed
-		if err := s.closeNoLock(); err != nil {
+		if err := s.closeNoLock(false); err != nil {
 			return closeWaitNeeded, err
 		}
 		return closeWaitNeeded, nil
@@ -2499,7 +2517,15 @@ func (fscm *measurementFieldSetChangeMgr) loadAllFieldChanges(log *zap.Logger) (
 			return nil
 		}
 	})()
+	changesetCount := 0
+	totalChanges := 0
 	for fcs, err = fscm.loadFieldChangeSet(fd); err == nil; fcs, err = fscm.loadFieldChangeSet(fd) {
+		totalChanges += len(fcs)
+		changesetCount++
+		log.Debug("loading field change set",
+			zap.Int("set", changesetCount),
+			zap.Int("changes", len(fcs)),
+			zap.Int("total_changes", totalChanges))
 		changes = append(changes, fcs)
 	}
 	if errors.Is(err, io.EOF) {
@@ -2543,7 +2569,7 @@ func (fscm *measurementFieldSetChangeMgr) loadFieldChangeSet(r io.Reader) (Field
 }
 
 func (fs *MeasurementFieldSet) ApplyChanges() error {
-	log, end := logger.NewOperation(context.TODO(), fs.changeMgr.logger, "loading changes", "field indices")
+	log, end := logger.NewOperation(context.TODO(), fs.changeMgr.logger, "loading changes", "field indices", zap.String("path", fs.changeMgr.changeFilePath))
 	defer end()
 	changes, err := fs.changeMgr.loadAllFieldChanges(log)
 	if err != nil {
